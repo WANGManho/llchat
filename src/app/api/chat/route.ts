@@ -14,6 +14,12 @@ type Correction = {
   suggested_rewrite: string;
 };
 
+type StructuredResponse = {
+  assistant_reply: string;
+  corrections: Correction[];
+  follow_up_questions: string[];
+};
+
 const SYSTEM_PROMPT = [
   "You are a friendly English conversation partner.",
   "Always reply in natural English and keep the conversation going.",
@@ -59,6 +65,139 @@ const RESPONSE_SCHEMA = {
   required: ["assistant_reply", "follow_up_questions", "corrections"],
 } as const;
 
+const normalizeStructuredResponse = (parsed: unknown): StructuredResponse | null => {
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.assistant_reply !== "string") {
+    return null;
+  }
+  const corrections = Array.isArray(record.corrections)
+    ? (record.corrections as Correction[]).filter(
+        (item) =>
+          item &&
+          typeof item.issue === "string" &&
+          typeof item.explanation === "string" &&
+          typeof item.suggested_rewrite === "string"
+      )
+    : [];
+  const followUpQuestions = Array.isArray(record.follow_up_questions)
+    ? (record.follow_up_questions as unknown[]).filter(
+        (item) => typeof item === "string"
+      )
+    : [];
+  return {
+    assistant_reply: record.assistant_reply,
+    corrections,
+    follow_up_questions: followUpQuestions,
+  };
+};
+
+const parseStructuredOutput = (
+  raw?: string | null
+): StructuredResponse | null => {
+  if (!raw) {
+    return null;
+  }
+  let cleaned = raw.trim();
+  if (!cleaned) {
+    return null;
+  }
+  cleaned = cleaned
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```$/i, "")
+    .trim();
+
+  try {
+    const parsed = JSON.parse(cleaned);
+    return normalizeStructuredResponse(parsed);
+  } catch {
+    // Fall through to substring extraction.
+  }
+
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) {
+    try {
+      const parsed = JSON.parse(cleaned.slice(start, end + 1));
+      return normalizeStructuredResponse(parsed);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+};
+
+const generateWithResponses = async (
+  messages: ClientMessage[]
+): Promise<StructuredResponse | null> => {
+  try {
+    const response = await openai.responses.create({
+      model: MODEL,
+      input: [{ role: "developer", content: SYSTEM_PROMPT }, ...messages],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "english_chat_feedback",
+          strict: true,
+          schema: RESPONSE_SCHEMA,
+        },
+      },
+    });
+
+    return parseStructuredOutput(response.output_text);
+  } catch {
+    return null;
+  }
+};
+
+const generateWithChat = async (
+  messages: ClientMessage[]
+): Promise<StructuredResponse | null> => {
+  try {
+    const completion = await openai.chat.completions.create({
+      model: MODEL,
+      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: "english_chat_feedback",
+          strict: true,
+          schema: RESPONSE_SCHEMA,
+        },
+      },
+    });
+
+    const content = completion.choices[0]?.message?.content;
+    const parsed = parseStructuredOutput(content);
+    if (parsed) {
+      return parsed;
+    }
+  } catch {
+    // ignore and try relaxed JSON prompt below
+  }
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: MODEL,
+      messages: [
+        {
+          role: "system",
+          content: `${SYSTEM_PROMPT}\nReturn ONLY valid JSON, no extra text, no code fences.`,
+        },
+        ...messages,
+      ],
+      temperature: 0,
+    });
+
+    const content = completion.choices[0]?.message?.content;
+    return parseStructuredOutput(content);
+  } catch {
+    return null;
+  }
+};
+
 export async function POST(request: Request) {
   if (!process.env.OPENAI_API_KEY) {
     return NextResponse.json(
@@ -91,80 +230,18 @@ export async function POST(request: Request) {
     );
   }
 
-  try {
-    const response = await openai.responses.create({
-      model: MODEL,
-      input: [{ role: "developer", content: SYSTEM_PROMPT }, ...messages],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "english_chat_feedback",
-          strict: true,
-          schema: RESPONSE_SCHEMA,
-        },
+  const structured =
+    (await generateWithResponses(messages)) ?? (await generateWithChat(messages));
+
+  if (!structured) {
+    return NextResponse.json(
+      {
+        error:
+          "Model did not return valid JSON. Please use a model that supports structured outputs (e.g. gpt-4o-mini) and avoid non-OpenAI base URLs.",
       },
-    });
-
-    const outputText = response.output_text?.trim();
-    if (!outputText) {
-      return NextResponse.json(
-        { error: "Empty response from model." },
-        { status: 502 }
-      );
-    }
-
-    const parsed = JSON.parse(outputText) as {
-      assistant_reply: string;
-      corrections: Correction[];
-    };
-
-    return NextResponse.json(parsed);
-  } catch (error) {
-    const status =
-      typeof error === "object" && error !== null && "status" in error
-        ? (error as { status?: number }).status
-        : undefined;
-    const message =
-      error instanceof Error ? error.message : "Failed to generate response.";
-
-    if (status === 404 || message.includes("404")) {
-      try {
-        const completion = await openai.chat.completions.create({
-          model: MODEL,
-          messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
-          response_format: {
-            type: "json_schema",
-            json_schema: {
-              name: "english_chat_feedback",
-              strict: true,
-              schema: RESPONSE_SCHEMA,
-            },
-          },
-        });
-
-        const content = completion.choices[0]?.message?.content?.trim();
-        if (!content) {
-          return NextResponse.json(
-            { error: "Empty response from model." },
-            { status: 502 }
-          );
-        }
-
-        const parsed = JSON.parse(content) as {
-          assistant_reply: string;
-          corrections: Correction[];
-        };
-
-        return NextResponse.json(parsed);
-      } catch (fallbackError) {
-        const fallbackMessage =
-          fallbackError instanceof Error
-            ? fallbackError.message
-            : "Failed to generate response.";
-        return NextResponse.json({ error: fallbackMessage }, { status: 500 });
-      }
-    }
-
-    return NextResponse.json({ error: message }, { status: 500 });
+      { status: 502 }
+    );
   }
+
+  return NextResponse.json(structured);
 }
